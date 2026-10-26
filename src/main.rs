@@ -6,6 +6,10 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
+mod theme;
+mod ui;
+mod widgets;
+
 // Driver Intel RST VMD untuk deteksi disk NVMe SSD pada Windows Installer
 const IASTORVD_INF: &[u8] = include_bytes!("../drivers/vmd/iaStorVD.inf");
 const IASTORVD_SYS: &[u8] = include_bytes!("../drivers/vmd/iaStorVD.sys");
@@ -49,16 +53,16 @@ const AUTOUNATTEND_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 "#;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct DiskInfo {
-    device: String,         // "/dev/disk3s3" atau "/dev/disk3"
-    parent_device: String,  // "/dev/disk3"
-    media_name: String,     // "SanDisk Portable SSD"
-    volume_name: String,    // "WIN10"
-    size: String,           // "49.9 GB"
-    protocol: String,       // "USB"
-    display: String,
-    is_usb: bool,
-    is_partition: bool,     // true jika single partition / split volume
+pub(crate) struct DiskInfo {
+    pub(crate) device: String,         // "/dev/disk3s3" atau "/dev/disk3"
+    pub(crate) parent_device: String,  // "/dev/disk3"
+    pub(crate) media_name: String,     // "SanDisk Portable SSD"
+    pub(crate) volume_name: String,    // "WIN10"
+    pub(crate) size: String,           // "49.9 GB"
+    pub(crate) protocol: String,       // "USB"
+    pub(crate) display: String,
+    pub(crate) is_usb: bool,
+    pub(crate) is_partition: bool,     // true jika single partition / split volume
 }
 
 enum BackgroundMessage {
@@ -68,26 +72,39 @@ enum BackgroundMessage {
     Finished(bool, String),
 }
 
-struct WinDiskApp {
-    iso_path: String,
-    iso_name: String,
-    iso_size: String,
-    selected_disk: String,
-    available_disks: Vec<DiskInfo>,
-    status: String,
-    current_step: usize,
-    is_creating: bool,
-    patch_vmd: bool,
-    bypass_tpm: bool,
-    log: String,
-    show_confirm_dialog: bool,
-    show_log_panel: bool,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StatusLevel {
+    Info,
+    Success,
+    Error,
+}
+
+pub(crate) struct WinDiskApp {
+    pub(crate) iso_path: String,
+    pub(crate) iso_name: String,
+    pub(crate) iso_size: String,
+    pub(crate) selected_disk: String,
+    pub(crate) available_disks: Vec<DiskInfo>,
+    pub(crate) status: String,
+    pub(crate) status_level: StatusLevel,
+    pub(crate) current_step: usize,
+    pub(crate) is_creating: bool,
+    pub(crate) patch_vmd: bool,
+    pub(crate) bypass_tpm: bool,
+    pub(crate) log: String,
+    pub(crate) show_confirm_dialog: bool,
+    pub(crate) show_log_panel: bool,
+    pub(crate) dark: bool,
     disk_receiver: Receiver<Vec<DiskInfo>>,
     worker_receiver: Option<Receiver<BackgroundMessage>>,
 }
 
 impl WinDiskApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let dark = cc.egui_ctx.style().visuals.dark_mode;
+        theme::install_fonts(&cc.egui_ctx);
+        theme::apply_style(&cc.egui_ctx, dark);
+
         // Channel untuk background USB auto-detect
         let (disk_tx, disk_rx) = channel::<Vec<DiskInfo>>();
 
@@ -118,7 +135,8 @@ impl WinDiskApp {
             iso_size: String::new(),
             selected_disk: String::new(),
             available_disks: Vec::new(),
-            status: "Siap. Silakan pilih berkas ISO dan partisi / flashdisk USB.".to_string(),
+            status: "Pilih berkas ISO dan drive tujuan untuk memulai.".to_string(),
+            status_level: StatusLevel::Info,
             current_step: 0,
             is_creating: false,
             patch_vmd: true, // Default aktif agar SSD NVMe terdeteksi di laptop modern
@@ -126,8 +144,30 @@ impl WinDiskApp {
             log: "=== WinDisk Maker v1.2 ===\nSistem siap. Mendeteksi perangkat USB & partisi split volume di latar belakang...\n".to_string(),
             show_confirm_dialog: false,
             show_log_panel: false,
+            dark,
             disk_receiver: disk_rx,
             worker_receiver: None,
+        }
+    }
+
+    pub(crate) fn pick_iso(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Windows ISO Image", &["iso"])
+            .pick_file()
+        {
+            self.iso_path = path.display().to_string();
+            self.iso_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.iso_size = fs::metadata(&path)
+                .map(|meta| {
+                    let gb = meta.len() as f64 / (1024.0 * 1024.0 * 1024.0);
+                    format!("{:.2} GB", gb)
+                })
+                .unwrap_or_default();
+            self.status = format!("ISO dipilih: {}", self.iso_name);
+            self.status_level = StatusLevel::Info;
         }
     }
 
@@ -351,7 +391,7 @@ impl WinDiskApp {
     }
 
     /// Mulai proses pembuatan bootable di thread terpisah dengan streaming log langsung
-    fn start_worker_process(&mut self) {
+    pub(crate) fn start_worker_process(&mut self) {
         let disk = self.selected_disk.clone();
         let iso = self.iso_path.clone();
         let patch_vmd = self.patch_vmd;
@@ -359,11 +399,13 @@ impl WinDiskApp {
 
         if iso.is_empty() || disk.is_empty() {
             self.status = "Harap tentukan file ISO dan USB/partisi tujuan terlebih dahulu.".to_string();
+            self.status_level = StatusLevel::Error;
             return;
         }
 
         if disk == "/dev/disk0" || disk == "/dev/disk1" {
             self.status = "Keamanan: Dilarang memformat disk sistem Mac!".to_string();
+            self.status_level = StatusLevel::Error;
             return;
         }
 
@@ -374,6 +416,7 @@ impl WinDiskApp {
 
         self.is_creating = true;
         self.current_step = 1;
+        self.status_level = StatusLevel::Info;
         self.status = format!("Memulai persiapan format pada {}...", disk);
         self.log.push_str(&format!("\n\n>>> MEMULAI PEMBUATAN BOOTABLE: {} -> {}\n", iso, disk));
         if is_target_partition {
@@ -698,11 +741,13 @@ impl WinDiskApp {
                         if !self.is_creating {
                             let tipe_str = if first.is_partition { "Partisi" } else { "Drive" };
                             self.status = format!("Terhubung: {} [{}] ({})", first.media_name, tipe_str, first.volume_name);
+                            self.status_level = StatusLevel::Info;
                         }
                     } else {
                         self.selected_disk.clear();
                         if !self.is_creating {
                             self.status = "Menunggu flashdisk / SSD eksternal dicolokkan ke Mac...".to_string();
+                            self.status_level = StatusLevel::Info;
                         }
                     }
                 } else if self.selected_disk.is_empty() && !new_disks.is_empty() {
@@ -737,6 +782,11 @@ impl WinDiskApp {
                 }
                 BackgroundMessage::Finished(success, message) => {
                     self.status = message;
+                    self.status_level = if success {
+                        StatusLevel::Success
+                    } else {
+                        StatusLevel::Error
+                    };
                     self.is_creating = false;
                     self.current_step = if success { 6 } else { 0 };
                 }
@@ -749,569 +799,31 @@ impl eframe::App for WinDiskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_receivers();
 
+        // eframe follows the macOS appearance; re-apply our tokens when it flips.
+        let system_dark = ctx.style().visuals.dark_mode;
+        if system_dark != self.dark {
+            self.dark = system_dark;
+            theme::apply_style(ctx, self.dark);
+        }
+
         let refresh_rate = if self.is_creating {
             Duration::from_millis(100)
         } else {
-            Duration::from_millis(1000)
+            Duration::from_millis(500)
         };
         ctx.request_repaint_after(refresh_rate);
 
-        let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 8.0);
-        ctx.set_style(style);
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(16, 18, 24)).inner_margin(18.0))
-            .show(ctx, |ui| {
-                // HEADER ATAS
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("⚡ WinDisk Maker").size(22.0).strong().color(egui::Color32::from_rgb(240, 244, 250)));
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("NVMe Ready")
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(46, 204, 113))
-                                    .background_color(egui::Color32::from_rgb(18, 40, 28))
-                                    .strong(),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("Split Volume Safe")
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(56, 128, 255))
-                                    .background_color(egui::Color32::from_rgb(20, 36, 60))
-                                    .strong(),
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new("Pembuat USB Bootable Windows Profesional untuk Mac Intel & PC")
-                                .size(12.0)
-                                .color(egui::Color32::from_rgb(140, 150, 168)),
-                        );
-                    });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (badge_text, badge_color, bg_color) = if self.is_creating {
-                            ("⚡ Sedang Memproses...", egui::Color32::from_rgb(255, 193, 7), egui::Color32::from_rgb(45, 36, 15))
-                        } else if !self.selected_disk.is_empty() && !self.iso_path.is_empty() {
-                            ("● Siap Dimulai", egui::Color32::from_rgb(46, 204, 113), egui::Color32::from_rgb(18, 40, 28))
-                        } else {
-                            ("● Menunggu Input", egui::Color32::from_rgb(150, 160, 175), egui::Color32::from_rgb(30, 34, 42))
-                        };
-
-                        egui::Frame::none()
-                            .fill(bg_color)
-                            .rounding(4.0)
-                            .inner_margin(egui::vec2(8.0, 4.0))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(badge_text).size(12.0).strong().color(badge_color));
-                            });
-                    });
-                });
-
-                ui.add_space(14.0);
-
-                // WORKFLOW CARDS CONTAINER
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    // ==========================================
-                    // CARD 1: BERKAS CITRA ISO
-                    // ==========================================
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(24, 28, 38))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 48, 64)))
-                        .rounding(8.0)
-                        .inner_margin(14.0)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("1. File Citra ISO Windows").strong().size(14.0).color(egui::Color32::from_rgb(220, 228, 240)));
-                                if !self.iso_path.is_empty() {
-                                    ui.label(egui::RichText::new("✓ Terverifikasi").size(12.0).color(egui::Color32::from_rgb(46, 204, 113)));
-                                }
-                            });
-
-                            ui.add_space(8.0);
-
-                            if self.iso_path.is_empty() {
-                                ui.horizontal(|ui| {
-                                    if ui.button(egui::RichText::new("📂 Pilih Berkas ISO Windows (.iso)...").size(13.0).strong()).clicked() {
-                                        if let Some(path) = rfd::FileDialog::new().add_filter("Windows ISO Image", &["iso"]).pick_file() {
-                                            self.iso_path = path.display().to_string();
-                                            self.iso_name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-                                            if let Ok(meta) = fs::metadata(&path) {
-                                                let gb = meta.len() as f64 / (1024.0 * 1024.0 * 1024.0);
-                                                self.iso_size = format!("{:.2} GB", gb);
-                                            }
-                                        }
-                                    }
-                                    ui.label(egui::RichText::new("Dukungan untuk Windows 11, Windows 10, atau Windows Server").size(12.0).color(egui::Color32::from_rgb(120, 130, 145)));
-                                });
-                            } else {
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(19, 23, 32))
-                                    .rounding(6.0)
-                                    .inner_margin(10.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new("💿").size(20.0));
-                                            ui.vertical(|ui| {
-                                                ui.label(egui::RichText::new(&self.iso_name).strong().color(egui::Color32::WHITE));
-                                                ui.horizontal(|ui| {
-                                                    ui.label(egui::RichText::new(&self.iso_size).color(egui::Color32::from_rgb(56, 128, 255)).size(11.0));
-                                                    ui.label(egui::RichText::new(&self.iso_path).color(egui::Color32::from_rgb(120, 130, 145)).size(11.0));
-                                                });
-                                            });
-
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                if ui.button("Ganti ISO").clicked() {
-                                                    if let Some(path) = rfd::FileDialog::new().add_filter("Windows ISO Image", &["iso"]).pick_file() {
-                                                        self.iso_path = path.display().to_string();
-                                                        self.iso_name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-                                                        if let Ok(meta) = fs::metadata(&path) {
-                                                            let gb = meta.len() as f64 / (1024.0 * 1024.0 * 1024.0);
-                                                            self.iso_size = format!("{:.2} GB", gb);
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        });
-                                    });
-                            }
-                        });
-
-                    ui.add_space(10.0);
-
-                    // ==========================================
-                    // CARD 2: FLASHDISK / PARTISI USB TUJUAN (AUTO-DETECT + SPLIT VOLUME SAFE)
-                    // ==========================================
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(24, 28, 38))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 48, 64)))
-                        .rounding(8.0)
-                        .inner_margin(14.0)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("2. Drive USB / Partisi Target").strong().size(14.0).color(egui::Color32::from_rgb(220, 228, 240)));
-                                ui.label(egui::RichText::new("• Deteksi Split Volume Aktif").size(11.0).color(egui::Color32::from_rgb(56, 128, 255)));
-                            });
-
-                            ui.add_space(8.0);
-
-                            // KARTU TOMBOL PILIH CEPAT PARTISI
-                            let partition_items: Vec<_> = self.available_disks.iter().filter(|d| d.is_partition).cloned().collect();
-                            if !partition_items.is_empty() {
-                                ui.label(egui::RichText::new("🎯 Klik Partisi yang Ingin Diformat (Partisi lain aman):").strong().size(12.0).color(egui::Color32::from_rgb(180, 200, 230)));
-                                ui.add_space(2.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    for part in &partition_items {
-                                        let is_selected = self.selected_disk == part.device;
-                                        let is_win_suggested = part.volume_name.to_lowercase().contains("win");
-                                        let tag = if is_win_suggested { " ⭐" } else { "" };
-                                        let btn_text = format!("📁 {}{}\n({})", part.volume_name, tag, part.size);
-
-                                        let btn = egui::Button::new(
-                                            egui::RichText::new(&btn_text)
-                                                .strong()
-                                                .size(12.0)
-                                                .color(if is_selected { egui::Color32::WHITE } else { egui::Color32::from_rgb(100, 240, 160) })
-                                        )
-                                        .fill(if is_selected { egui::Color32::from_rgb(37, 99, 235) } else { egui::Color32::from_rgb(26, 38, 32) })
-                                        .stroke(egui::Stroke::new(1.0, if is_selected { egui::Color32::from_rgb(90, 160, 255) } else { egui::Color32::from_rgb(46, 204, 113) }))
-                                        .min_size(egui::vec2(130.0, 36.0));
-
-                                        if ui.add(btn).clicked() {
-                                            self.selected_disk = part.device.clone();
-                                        }
-                                    }
-                                });
-                                ui.add_space(8.0);
-                            }
-
-                            let selected_info = self.available_disks.iter().find(|d| d.device == self.selected_disk);
-                            let selected_text = selected_info
-                                .map(|d| d.display.clone())
-                                .unwrap_or_else(|| {
-                                    if self.available_disks.is_empty() {
-                                        "⏳ Menunggu flashdisk / SSD eksternal dicolokkan ke Mac...".to_string()
-                                    } else {
-                                        "Pilih Drive atau Partisi USB...".to_string()
-                                    }
-                                });
-
-                            ui.label(egui::RichText::new("Atau pilih dari daftar dropdown:").size(11.0).color(egui::Color32::from_rgb(140, 150, 165)));
-                            ui.add_space(2.0);
-
-                            egui::ComboBox::from_id_source("usb_combo_picker")
-                                .width(ui.available_width() - 8.0)
-                                .selected_text(egui::RichText::new(&selected_text).strong().size(13.0))
-                                .show_ui(ui, |ui| {
-                                    if self.available_disks.is_empty() {
-                                        ui.label("Tidak ada USB/SSD terdeteksi. Silakan tancapkan drive Anda.");
-                                    } else {
-                                        for disk in &self.available_disks {
-                                            let text_color = if disk.is_partition {
-                                                egui::Color32::from_rgb(46, 204, 113) // Hijau untuk partisi aman
-                                            } else {
-                                                egui::Color32::from_rgb(235, 120, 120) // Kuning kemerahan untuk full disk wipe
-                                            };
-                                            let text = egui::RichText::new(&disk.display).color(text_color).strong();
-                                            if ui.selectable_label(self.selected_disk == disk.device, text).clicked() {
-                                                self.selected_disk = disk.device.clone();
-                                            }
-                                        }
-                                    }
-                                });
-
-                            // KARTU INFORMASI RINCI & PERINGATAN KEAMANAN PARTISI VS FULL DISK
-                            if let Some(info) = selected_info {
-                                ui.add_space(8.0);
-
-                                if info.is_partition {
-                                    // MODE PARTISI AMAN (SPLIT VOLUME)
-                                    egui::Frame::none()
-                                        .fill(egui::Color32::from_rgb(18, 34, 28))
-                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 204, 113)))
-                                        .rounding(6.0)
-                                        .inner_margin(10.0)
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("🛡️ MODE AMAN (HANYA FORMAT 1 PARTISI INI):").strong().color(egui::Color32::from_rgb(46, 204, 113)).size(12.0));
-                                            });
-                                            ui.add_space(2.0);
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "Aplikasi HANYA akan memformat partisi \"{}\" ({}) pada {}. Partisi lain di SSD ini (seperti Kontakt, macOS, dll.) 100% AMAN dan TIDAK AKAN HILANG!",
-                                                    info.volume_name, info.size, info.device
-                                                ))
-                                                .color(egui::Color32::WHITE)
-                                                .size(12.0)
-                                            );
-                                        });
-                                } else {
-                                    // PERINGATAN FULL DISK WIPE
-                                    egui::Frame::none()
-                                        .fill(egui::Color32::from_rgb(38, 20, 20))
-                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(235, 87, 87)))
-                                        .rounding(6.0)
-                                        .inner_margin(10.0)
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("⚠️ PERINGATAN: FORMAT SELURUH DISK DIPILIH!").strong().color(egui::Color32::from_rgb(235, 87, 87)).size(12.0));
-                                            });
-                                            ui.add_space(2.0);
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    "Memilih opsi ini akan MENGHAPUS SEMUA PARTISI di drive ini (termasuk partisi Kontakt, dll.)! Jika hanya ingin memformat partisi Windows saja, pilih opsi [PARTISI AMAN] di tombol atas."
-                                                )
-                                                .color(egui::Color32::from_rgb(255, 200, 200))
-                                                .size(12.0)
-                                            );
-                                        });
-                                }
-
-                                ui.add_space(8.0);
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(19, 23, 32))
-                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(32, 45, 65)))
-                                    .rounding(6.0)
-                                    .inner_margin(10.0)
-                                    .show(ui, |ui| {
-                                        egui::Grid::new("usb_specs_grid")
-                                            .num_columns(4)
-                                            .spacing([18.0, 6.0])
-                                            .show(ui, |ui| {
-                                                ui.label(egui::RichText::new("Perangkat Fisik:").color(egui::Color32::from_rgb(130, 140, 155)).size(12.0));
-                                                ui.label(egui::RichText::new(&info.media_name).strong().color(egui::Color32::WHITE).size(12.0));
-
-                                                ui.label(egui::RichText::new("Target Format:").color(egui::Color32::from_rgb(130, 140, 155)).size(12.0));
-                                                let target_type_str = if info.is_partition { "Partisi Tunggal (Aman)" } else { "Seluruh Drive" };
-                                                ui.label(egui::RichText::new(target_type_str).strong().color(egui::Color32::from_rgb(56, 128, 255)).size(12.0));
-                                                ui.end_row();
-
-                                                ui.label(egui::RichText::new("Kapasitas Target:").color(egui::Color32::from_rgb(130, 140, 155)).size(12.0));
-                                                ui.label(egui::RichText::new(&info.size).strong().color(egui::Color32::from_rgb(46, 204, 113)).size(12.0));
-
-                                                ui.label(egui::RichText::new("Target Device Node:").color(egui::Color32::from_rgb(130, 140, 155)).size(12.0));
-                                                ui.label(egui::RichText::new(&info.device).monospace().color(egui::Color32::from_rgb(170, 180, 200)).size(12.0));
-                                                ui.end_row();
-                                            });
-                                    });
-                            } else {
-                                ui.add_space(4.0);
-                                ui.label(egui::RichText::new("💡 Flashdisk atau External SSD Anda akan otomatis muncul begitu ditancapkan ke port USB.").color(egui::Color32::from_rgb(120, 130, 145)).size(12.0));
-                            }
-                        });
-
-                    ui.add_space(10.0);
-
-                    // ==========================================
-                    // CARD 3: PENGATURAN TARGET SISTEM & FORMAT
-                    // ==========================================
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(24, 28, 38))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 48, 64)))
-                        .rounding(8.0)
-                        .inner_margin(14.0)
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("3. Standar Kompatibilitas Boot & Patch").strong().size(14.0).color(egui::Color32::from_rgb(220, 228, 240)));
-                            ui.add_space(6.0);
-
-                            egui::Grid::new("config_grid")
-                                .num_columns(2)
-                                .spacing([20.0, 6.0])
-                                .show(ui, |ui| {
-                                    let selected_is_part = self.available_disks.iter().find(|d| d.device == self.selected_disk).map(|d| d.is_partition).unwrap_or(false);
-
-                                    ui.label(egui::RichText::new("Mode Format:").size(12.0).color(egui::Color32::from_rgb(140, 150, 165)));
-                                    if selected_is_part {
-                                        ui.label(egui::RichText::new("Erase Volume FAT32 (Tabel Partisi GPT SSD Asli Tetap Utuh)").strong().size(12.0).color(egui::Color32::from_rgb(46, 204, 113)));
-                                    } else {
-                                        ui.label(egui::RichText::new("MBR FAT32 (Format Ulang Seluruh Disk)").strong().size(12.0).color(egui::Color32::WHITE));
-                                    }
-                                    ui.end_row();
-
-                                    ui.label(egui::RichText::new("Sistem Berkas:").size(12.0).color(egui::Color32::from_rgb(140, 150, 165)));
-                                    ui.label(egui::RichText::new("FAT32 (MS-DOS) dengan Pemecahan Berkas WIM Otomatis").strong().size(12.0).color(egui::Color32::WHITE));
-                                    ui.end_row();
-
-                                    ui.label(egui::RichText::new("Label Boot Drive Baru:").size(12.0).color(egui::Color32::from_rgb(140, 150, 165)));
-                                    ui.label(egui::RichText::new("WIN11").strong().color(egui::Color32::from_rgb(56, 128, 255)).size(12.0));
-                                    ui.end_row();
-                                });
-
-                            ui.add_space(10.0);
-                            ui.separator();
-                            ui.add_space(6.0);
-
-                            // OPSI PATCH DRIVER INTEL VMD / NVMe SSD
-                            ui.checkbox(
-                                &mut self.patch_vmd,
-                                egui::RichText::new("⚡ Pasang Patch Driver NVMe / Intel VMD (iaStorVD)")
-                                    .strong()
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(46, 204, 113)),
-                            );
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Menyertakan iaStorVD.inf, iaStorVD.sys, iaStorVD.cat ke $WinPEDriver$ & /drivers/Intel_VMD/ agar disk NVMe SSD langsung terdeteksi otomatis saat install Windows (mengatasi pesan 'No drives were found')."
-                                )
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 160, 175)),
-                            );
-
-                            ui.add_space(8.0);
-
-                            // OPSI BYPASS PERSYARATAN WINDOWS 11 (TPM 2.0 / SECURE BOOT / RAM)
-                            ui.checkbox(
-                                &mut self.bypass_tpm,
-                                egui::RichText::new("🛡️ Bypass Persyaratan Windows 11 (TPM 2.0, Secure Boot, & RAM)")
-                                    .strong()
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(56, 189, 248)),
-                            );
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Menyuntikkan konfigurasi autounattend.xml (BypassTPMCheck, BypassSecureBootCheck, BypassRAMCheck, BypassCPUCheck) agar instalasi Windows 11 tidak gagal/crash (Error 0x80070006 - 0x40031) pada PC atau Mac tanpa TPM 2.0."
-                                )
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 160, 175)),
-                            );
-                        });
-
-                    ui.add_space(14.0);
-
-                    // ==========================================
-                    // EKSEKUSI & STATUS PROGRES
-                    // ==========================================
-                    if self.is_creating {
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(20, 24, 34))
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 128, 255)))
-                            .rounding(8.0)
-                            .inner_margin(14.0)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("⏳ PROSES SEDANG BERJALAN").strong().color(egui::Color32::from_rgb(255, 193, 7)));
-                                    ui.label(egui::RichText::new("(Jangan mencabut flashdisk USB!)").size(12.0).color(egui::Color32::from_rgb(235, 87, 87)));
-                                });
-
-                                ui.add_space(6.0);
-                                let fraction = match self.current_step {
-                                    1 => 0.15,
-                                    2 => 0.25,
-                                    3 => 0.60,
-                                    4 => 0.80,
-                                    5 => 0.92,
-                                    6 => 1.0,
-                                    _ => 0.05,
-                                };
-                                ui.add(egui::ProgressBar::new(fraction).animate(true).text(&self.status));
-
-                                ui.add_space(8.0);
-                                ui.horizontal(|ui| {
-                                    let step_names = ["1. Format", "2. Mount ISO", "3. Salin Berkas", "4. Optimasi WIM", "5. Patch NVMe", "6. Selesai"];
-                                    for (i, name) in step_names.iter().enumerate() {
-                                        let step_num = i + 1;
-                                        let color = if self.current_step > step_num {
-                                            egui::Color32::from_rgb(46, 204, 113)
-                                        } else if self.current_step == step_num {
-                                            egui::Color32::from_rgb(56, 128, 255)
-                                        } else {
-                                            egui::Color32::from_rgb(80, 90, 105)
-                                        };
-                                        ui.label(egui::RichText::new(*name).size(11.0).color(color).strong());
-                                        if i < step_names.len() - 1 {
-                                            ui.label(egui::RichText::new("➔").size(11.0).color(egui::Color32::from_rgb(60, 70, 85)));
-                                        }
-                                    }
-                                });
-                            });
-                    } else {
-                        let is_ready = !self.selected_disk.is_empty() && !self.iso_path.is_empty();
-
-                        let button_color = if is_ready {
-                            egui::Color32::from_rgb(37, 99, 235)
-                        } else {
-                            egui::Color32::from_rgb(45, 55, 72)
-                        };
-
-                        let start_btn = egui::Button::new(
-                            egui::RichText::new("🚀 MULAI PEMBUATAN USB BOOTABLE")
-                                .size(15.0)
-                                .color(egui::Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(button_color)
-                        .min_size(egui::vec2(ui.available_width(), 46.0));
-
-                        if ui.add_enabled(is_ready, start_btn).clicked() {
-                            self.show_confirm_dialog = true;
-                        }
-
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_rgb(100, 220, 150)).strong().size(12.0));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let toggle_text = if self.show_log_panel { "Tutup Log Konsol" } else { "Lihat Log Konsol" };
-                                if ui.button(toggle_text).clicked() {
-                                    self.show_log_panel = !self.show_log_panel;
-                                }
-                            });
-                        });
-                    }
-
-                    // ==========================================
-                    // LOG KONSOL STREAMING TERINTEGRASI
-                    // ==========================================
-                    if self.show_log_panel || self.is_creating {
-                        ui.add_space(8.0);
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(12, 14, 18))
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 42, 54)))
-                            .rounding(6.0)
-                            .inner_margin(10.0)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("📟 Log Eksekusi Sistem (Live Streaming):").size(12.0).color(egui::Color32::from_rgb(140, 150, 168)).strong());
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Bersihkan").clicked() {
-                                            self.log.clear();
-                                        }
-                                    });
-                                });
-                                ui.add_space(4.0);
-                                egui::ScrollArea::vertical()
-                                    .max_height(160.0)
-                                    .stick_to_bottom(true)
-                                    .show(ui, |ui| {
-                                        ui.monospace(egui::RichText::new(&self.log).size(11.0).color(egui::Color32::from_rgb(74, 222, 128)));
-                                    });
-                            });
-                    }
-                });
-
-                // ==========================================
-                // DIALOG KONFIRMASI KEAMANAN
-                // ==========================================
-                if self.show_confirm_dialog {
-                    let selected_info = self.available_disks.iter().find(|d| d.device == self.selected_disk);
-                    let target_display = selected_info.map(|d| d.display.clone()).unwrap_or_else(|| self.selected_disk.clone());
-                    let is_part = selected_info.map(|d| d.is_partition).unwrap_or(false);
-
-                    egui::Window::new("⚠️ Konfirmasi Format Target")
-                        .collapsible(false)
-                        .resizable(false)
-                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                        .show(ctx, |ui| {
-                            ui.set_width(480.0);
-
-                            if is_part {
-                                ui.label(egui::RichText::new("KONFIRMASI FORMAT PARTISI (MODE AMAN)").color(egui::Color32::from_rgb(46, 204, 113)).size(15.0).strong());
-                                ui.add_space(6.0);
-                                ui.label("Aplikasi HANYA akan memformat partisi tunggal berikut:");
-                                ui.add_space(4.0);
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(18, 34, 28))
-                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 204, 113)))
-                                    .rounding(4.0)
-                                    .inner_margin(8.0)
-                                    .show(ui, |ui| {
-                                        ui.label(egui::RichText::new(&target_display).strong().color(egui::Color32::WHITE));
-                                    });
-                                ui.add_space(6.0);
-                                ui.label(egui::RichText::new("🛡️ Seluruh partisi lain di SSD ini (seperti Kontakt, macOS, dll.) TETAP AMAN dan TIDAK AKAN HILANG.").color(egui::Color32::from_rgb(100, 255, 120)).size(12.0));
-                            } else {
-                                ui.label(egui::RichText::new("PERINGATAN FORMAT SELURUH DISK (FULL WIPE)").color(egui::Color32::from_rgb(235, 87, 87)).size(15.0).strong());
-                                ui.add_space(6.0);
-                                ui.label("PERHATIAN: Semua partisi pada drive berikut AKAN DIHAPUS PERMANEN:");
-                                ui.add_space(4.0);
-                                egui::Frame::none()
-                                    .fill(egui::Color32::from_rgb(38, 20, 20))
-                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(235, 87, 87)))
-                                    .rounding(4.0)
-                                    .inner_margin(8.0)
-                                    .show(ui, |ui| {
-                                        ui.label(egui::RichText::new(&target_display).strong().color(egui::Color32::from_rgb(255, 193, 7)));
-                                    });
-                                ui.add_space(6.0);
-                                ui.label(egui::RichText::new("⚠️ Pastikan Anda tidak memiliki data penting di partisi lain sebelum melanjutkan.").color(egui::Color32::from_rgb(255, 150, 150)).size(12.0));
-                            }
-
-                            ui.add_space(14.0);
-                            ui.horizontal(|ui| {
-                                let btn_text = if is_part { "Ya, Format Partisi Ini Saja" } else { "Ya, Format Seluruh Drive" };
-                                let confirm_btn = egui::Button::new(
-                                    egui::RichText::new(btn_text)
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                )
-                                .fill(if is_part { egui::Color32::from_rgb(37, 99, 235) } else { egui::Color32::from_rgb(220, 38, 38) });
-
-                                if ui.add(confirm_btn).clicked() {
-                                    self.show_confirm_dialog = false;
-                                    self.start_worker_process();
-                                }
-
-                                if ui.button("Batal").clicked() {
-                                    self.show_confirm_dialog = false;
-                                }
-                            });
-                        });
-                }
-            });
+        ui::app(self, ctx);
     }
 }
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([780.0, 720.0])
-            .with_min_inner_size([650.0, 580.0])
-            .with_title("WinDisk Maker - Windows Bootable Creator"),
+            .with_inner_size([760.0, 780.0])
+            .with_min_inner_size([680.0, 620.0])
+            .with_title("WinDisk Maker"),
+        follow_system_theme: true,
         ..Default::default()
     };
     eframe::run_native(

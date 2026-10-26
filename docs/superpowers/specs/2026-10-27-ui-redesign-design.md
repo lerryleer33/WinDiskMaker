@@ -68,7 +68,7 @@ warning / danger hanya untuk chip keamanan, status, dan aksi destruktif.
 
 ## Layout
 
-Satu jendela 780×800 (minimum 680×640), tiga area:
+Satu jendela 760×780 (minimum 680×620), tiga area:
 
 1. **Header tetap** — app mark 30px, judul, subtitle, status dot + label, versi.
 2. **Konten scroll** — tiga grup form:
