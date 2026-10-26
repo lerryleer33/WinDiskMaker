@@ -425,7 +425,7 @@ impl WinDiskApp {
             self.log.push_str(">>> MODE FULL DISK: Seluruh partisi pada drive akan diformat ulang.\n");
         }
         if patch_vmd {
-            self.log.push_str(">>> Fitur Patch NVMe SSD / Intel VMD: AKTIF (iaStorVD.inf, iaStorVD.sys, iaStorVD.cat)\n");
+            self.log.push_str(">>> Fitur Patch NVMe SSD / Intel VMD: AKTIF (paket driver lengkap 5 file)\n");
         }
         if bypass_tpm {
             self.log.push_str(">>> Fitur Bypass Persyaratan Windows 11: AKTIF (TPM 2.0, Secure Boot, RAM, & CPU check)\n");
@@ -589,7 +589,7 @@ impl WinDiskApp {
             let rsync_dst = format!("{}/", target_vol);
             
             // Gunakan bendera rsync yang kompatibel penuh dengan macOS bawaan
-            let _rsync_ok = run_cmd_streaming(&tx, "rsync", &[
+            let rsync_ok = run_cmd_streaming(&tx, "rsync", &[
                 "-rtv",
                 "--progress",
                 "--exclude=sources/install.wim",
@@ -598,10 +598,24 @@ impl WinDiskApp {
                 &rsync_dst,
             ]);
 
+            if !rsync_ok {
+                let _ = tx.send(BackgroundMessage::Finished(false, "Gagal menyalin berkas Windows (rsync error). Coba flash drive lain atau periksa ruang kosong USB.".to_string()));
+                return;
+            }
+
             let check_target_setup = format!("{}/setup.exe", target_vol);
             if !FsPath::new(&check_target_setup).exists() {
                 let _ = tx.send(BackgroundMessage::Finished(false, format!("Gagal menyalin berkas instalasi Windows ke {} (setup.exe tidak ditemukan).", target_vol)));
                 return;
+            }
+
+            // Pastikan file boot penting benar-benar ada setelah penyalinan.
+            for rel in ["bootmgr", "bootmgr.efi", "efi/boot/bootx64.efi", "sources/boot.wim"] {
+                let path = format!("{}/{}", target_vol, rel);
+                if !FsPath::new(&path).exists() {
+                    let _ = tx.send(BackgroundMessage::Finished(false, format!("Berkas penting hilang setelah penyalinan: {}. USB kemungkinan bermasalah.", rel)));
+                    return;
+                }
             }
             let _ = tx.send(BackgroundMessage::LogLine("✓ Berkas sistem Windows (bootloader, setup, dsb.) berhasil disalin.".to_string()));
 
@@ -620,21 +634,77 @@ impl WinDiskApp {
                 
                 let target_swm = format!("{}/install.swm", target_sources);
                 let split_ok = run_cmd_streaming(&tx, "wimlib-imagex", &["split", &wim_path, &target_swm, "3800"]);
-                
+
                 if !split_ok || !FsPath::new(&target_swm).exists() {
                     let _ = tx.send(BackgroundMessage::Finished(false, "Gagal memecah berkas install.wim! Periksa ruang sisa drive.".to_string()));
                     return;
                 }
-                let _ = tx.send(BackgroundMessage::LogLine("✓ Berkas install.wim berhasil dipecah menjadi SWM untuk dukungan UEFI FAT32.".to_string()));
+
+                // Kumpulkan semua bagian SWM dan urutkan berdasarkan nomor bagian.
+                let mut swm_parts: Vec<String> = Vec::new();
+                if let Ok(entries) = fs::read_dir(&target_sources) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with("install") && name.ends_with(".swm") {
+                            swm_parts.push(format!("{}/{}", target_sources, name));
+                        }
+                    }
+                }
+                swm_parts.sort_by_key(|path| {
+                    let name = FsPath::new(path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let stem = name
+                        .strip_prefix("install")
+                        .unwrap_or("")
+                        .strip_suffix(".swm")
+                        .unwrap_or("");
+                    if stem.is_empty() {
+                        1
+                    } else {
+                        stem.parse::<u32>().unwrap_or(u32::MAX)
+                    }
+                });
+
+                if swm_parts.is_empty() || !FsPath::new(&swm_parts[0]).exists() {
+                    let _ = tx.send(BackgroundMessage::Finished(false, "Bagian SWM tidak ditemukan setelah proses split.".to_string()));
+                    return;
+                }
+
+                let _ = tx.send(BackgroundMessage::Status("Memverifikasi hasil split WIM langsung dari USB...".to_string()));
+                let _ = tx.send(BackgroundMessage::LogLine(format!(">> Memverifikasi {} bagian SWM untuk memastikan tidak ada korupsi pada flash drive...", swm_parts.len())));
+
+                let mut verify_args: Vec<String> = vec!["verify".to_string(), swm_parts[0].clone()];
+                for part in &swm_parts[1..] {
+                    verify_args.push(format!("--ref={}", part));
+                }
+                let verify_refs: Vec<&str> = verify_args.iter().map(|s| s.as_str()).collect();
+                if !run_cmd_streaming(&tx, "wimlib-imagex", &verify_refs) {
+                    let _ = tx.send(BackgroundMessage::Finished(false, "Verifikasi SWM gagal. File install.swm/install2.swm kemungkinan corrupt karena flash drive bermasalah. Gunakan flash drive lain.".to_string()));
+                    return;
+                }
+                let _ = tx.send(BackgroundMessage::LogLine("✓ Verifikasi SWM berhasil: data instalasi terbaca utuh dari USB.".to_string()));
             } else if FsPath::new(&esd_path).exists() {
                 let _ = tx.send(BackgroundMessage::Status("Menyalin berkas terkompresi install.esd ke USB...".to_string()));
                 let target_esd = format!("{}/install.esd", target_sources);
-                let _ = run_cmd_streaming(&tx, "rsync", &["-rtv", "--progress", &esd_path, &target_esd]);
-                if !FsPath::new(&target_esd).exists() {
+                let esd_ok = run_cmd_streaming(&tx, "rsync", &["-rtv", "--progress", &esd_path, &target_esd]);
+                if !esd_ok || !FsPath::new(&target_esd).exists() {
                     let _ = tx.send(BackgroundMessage::Finished(false, "Gagal menyalin berkas install.esd!".to_string()));
                     return;
                 }
-                let _ = tx.send(BackgroundMessage::LogLine("✓ Berkas install.esd berhasil disalin.".to_string()));
+
+                let _ = tx.send(BackgroundMessage::Status("Memverifikasi install.esd langsung dari USB...".to_string()));
+                let verify_ok = Command::new("cmp")
+                    .args(["-s", esd_path.as_str(), target_esd.as_str()])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !verify_ok {
+                    let _ = tx.send(BackgroundMessage::Finished(false, "Verifikasi install.esd gagal: file di USB berbeda dari ISO. Gunakan flash drive lain.".to_string()));
+                    return;
+                }
+                let _ = tx.send(BackgroundMessage::LogLine("✓ Berkas install.esd berhasil disalin dan terverifikasi.".to_string()));
             } else {
                 let _ = tx.send(BackgroundMessage::Finished(false, "Tidak ditemukan install.wim maupun install.esd di dalam berkas ISO!".to_string()));
                 return;
@@ -646,34 +716,38 @@ impl WinDiskApp {
                 let _ = tx.send(BackgroundMessage::Status("Memasang patch driver Intel VMD / NVMe SSD (iaStorVD)...".to_string()));
                 let _ = tx.send(BackgroundMessage::LogLine("\n>> Memasang paket driver Intel RST VMD untuk deteksi NVMe...".to_string()));
 
-                // 1. Letakkan 5 file lengkap di /drivers/Intel_VMD/ (untuk opsi 'Load Driver' manual di Windows Setup)
-                let manual_driver_dir = format!("{}/drivers/Intel_VMD", target_vol);
-                let _ = fs::create_dir_all(&manual_driver_dir);
-                let full_driver_files: [(&str, &[u8]); 5] = [
+                // Paket driver Intel RST VMD harus lengkap. INF iaStorVD mereferensikan
+                // RstMwService.exe dan RstMwEventLogMsg.dll pada [SourceDisksFiles.amd64].
+                // Jika salah satu file hilang, Windows Setup gagal memuat driver saat
+                // memindai $WinPEDriver$ dan berhenti dengan error 0x80070002/0x80070006 - 0x40031.
+                let driver_files: [(&str, &[u8]); 5] = [
                     ("iaStorVD.inf", IASTORVD_INF),
                     ("iaStorVD.sys", IASTORVD_SYS),
                     ("iaStorVD.cat", IASTORVD_CAT),
                     ("RstMwService.exe", RST_MW_SERVICE),
                     ("RstMwEventLogMsg.dll", RST_MW_EVENT_LOG),
                 ];
-                for (name, data) in &full_driver_files {
-                    let _ = fs::write(format!("{}/{}", manual_driver_dir, name), data);
-                }
-                let _ = tx.send(BackgroundMessage::LogLine(format!("✓ Paket driver manual tersimpan di {}", manual_driver_dir)));
 
-                // 2. Letakkan HANYA file driver kernel murni (.inf, .sys, .cat) di /$WinPEDriver$/Intel_VMD/
-                // PENTING: Jangan menyertakan .exe atau .dll di $WinPEDriver$ agar WinPE driver loader tidak melempar error 0x80070006!
+                // 1. Folder manual untuk opsi "Load Driver" di Windows Setup.
+                let manual_driver_dir = format!("{}/drivers/Intel_VMD", target_vol);
+                // 2. Folder auto-load yang dipindai Windows Setup PE saat boot.
                 let winpe_driver_dir = format!("{}/$WinPEDriver$/Intel_VMD", target_vol);
-                let _ = fs::create_dir_all(&winpe_driver_dir);
-                let kernel_driver_files: [(&str, &[u8]); 3] = [
-                    ("iaStorVD.inf", IASTORVD_INF),
-                    ("iaStorVD.sys", IASTORVD_SYS),
-                    ("iaStorVD.cat", IASTORVD_CAT),
-                ];
-                for (name, data) in &kernel_driver_files {
-                    let _ = fs::write(format!("{}/{}", winpe_driver_dir, name), data);
+
+                for dir in [&manual_driver_dir, &winpe_driver_dir] {
+                    if let Err(e) = fs::create_dir_all(dir) {
+                        let _ = tx.send(BackgroundMessage::Finished(false, format!("Gagal membuat folder driver {}: {}", dir, e)));
+                        return;
+                    }
+                    for (name, data) in &driver_files {
+                        if let Err(e) = fs::write(format!("{}/{}", dir, name), data) {
+                            let _ = tx.send(BackgroundMessage::Finished(false, format!("Gagal menulis driver {}: {}", name, e)));
+                            return;
+                        }
+                    }
                 }
-                let _ = tx.send(BackgroundMessage::LogLine("✓ Driver kernel iaStorVD (.inf, .sys, .cat) siap di-load otomatis oleh Windows Setup PE.".to_string()));
+
+                let _ = tx.send(BackgroundMessage::LogLine(format!("✓ Paket driver manual (5 file) tersimpan di {}", manual_driver_dir)));
+                let _ = tx.send(BackgroundMessage::LogLine("✓ Paket driver VMD lengkap (5 file) siap di-load otomatis oleh Windows Setup PE.".to_string()));
             }
 
             // Injeksi Bypass Windows 11 (TPM 2.0, Secure Boot, RAM, CPU) jika diaktifkan
