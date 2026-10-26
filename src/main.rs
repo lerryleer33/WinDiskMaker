@@ -82,7 +82,7 @@ impl WinDiskApp {
             iso_size: String::new(),
             selected_disk: String::new(),
             available_disks: Vec::new(),
-            status: "Siap. Silakan pilih berkas ISO dan flashdisk/partisi USB.".to_string(),
+            status: "Siap. Silakan pilih berkas ISO dan partisi / flashdisk USB.".to_string(),
             current_step: 0,
             is_creating: false,
             patch_vmd: true, // Default aktif agar SSD NVMe terdeteksi di laptop modern
@@ -187,64 +187,67 @@ impl WinDiskApp {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 5 && parts[0].ends_with(':') {
                         if let Some(part_id) = parts.last() {
-                            if part_id.starts_with(disk_id) && part_id.contains('s') {
-                                if let Ok(part_info) = Command::new("diskutil").args(["info", part_id]).output() {
-                                    let p_txt = String::from_utf8_lossy(&part_info.stdout);
-                                    let mut v_name = String::new();
-                                    let mut part_size = String::new();
-                                    let mut part_type = String::new();
+                            // Validasi ketat bahwa ini partisi diskXsY, bukan whole disk diskX
+                            if let Some(suffix) = part_id.strip_prefix(disk_id) {
+                                if suffix.starts_with('s') && suffix[1..].chars().all(|c| c.is_ascii_digit()) {
+                                    if let Ok(part_info) = Command::new("diskutil").args(["info", part_id]).output() {
+                                        let p_txt = String::from_utf8_lossy(&part_info.stdout);
+                                        let mut v_name = String::new();
+                                        let mut part_size = String::new();
+                                        let mut part_type = String::new();
 
-                                    for p_line in p_txt.lines() {
-                                        if p_line.contains("Volume Name:") {
-                                            if let Some(v) = p_line.splitn(2, ':').nth(1) {
-                                                let n = v.trim();
-                                                if !n.is_empty() && n != "Not applicable (no file system)" {
-                                                    v_name = n.to_string();
+                                        for p_line in p_txt.lines() {
+                                            if p_line.contains("Volume Name:") {
+                                                if let Some(v) = p_line.splitn(2, ':').nth(1) {
+                                                    let n = v.trim();
+                                                    if !n.is_empty() && n != "Not applicable (no file system)" {
+                                                        v_name = n.to_string();
+                                                    }
+                                                }
+                                            } else if p_line.contains("Disk Size:") && part_size.is_empty() {
+                                                if let Some(v) = p_line.splitn(2, ':').nth(1) {
+                                                    part_size = v.split('(').next().unwrap_or("").trim().to_string();
+                                                }
+                                            } else if p_line.contains("Volume Total Space:") && part_size.is_empty() {
+                                                if let Some(v) = p_line.splitn(2, ':').nth(1) {
+                                                    part_size = v.split('(').next().unwrap_or("").trim().to_string();
+                                                }
+                                            } else if p_line.contains("Partition Type:") {
+                                                if let Some(v) = p_line.splitn(2, ':').nth(1) {
+                                                    part_type = v.trim().to_string();
                                                 }
                                             }
-                                        } else if p_line.contains("Disk Size:") && part_size.is_empty() {
-                                            if let Some(v) = p_line.splitn(2, ':').nth(1) {
-                                                part_size = v.split('(').next().unwrap_or("").trim().to_string();
-                                            }
-                                        } else if p_line.contains("Volume Total Space:") && part_size.is_empty() {
-                                            if let Some(v) = p_line.splitn(2, ':').nth(1) {
-                                                part_size = v.split('(').next().unwrap_or("").trim().to_string();
-                                            }
-                                        } else if p_line.contains("Partition Type:") {
-                                            if let Some(v) = p_line.splitn(2, ':').nth(1) {
-                                                part_type = v.trim().to_string();
-                                            }
                                         }
+
+                                        // Abaikan partisi EFI sistem agar aman
+                                        if part_type.contains("EFI") || v_name == "EFI" {
+                                            continue;
+                                        }
+
+                                        let final_vname = if !v_name.is_empty() {
+                                            partition_labels.push(v_name.clone());
+                                            v_name
+                                        } else if !part_type.is_empty() {
+                                            part_type
+                                        } else {
+                                            "Tanpa Label".to_string()
+                                        };
+
+                                        let part_dev = format!("/dev/{}", part_id);
+                                        let display = format!("📁 [PARTISI AMAN] \"{}\" ({}) - {} (Data lain aman)", final_vname, part_size, part_dev);
+
+                                        partitions.push(DiskInfo {
+                                            device: part_dev,
+                                            parent_device: dev.clone(),
+                                            media_name: media_name.clone(),
+                                            volume_name: final_vname,
+                                            size: part_size,
+                                            protocol: protocol.clone(),
+                                            display,
+                                            is_usb: true,
+                                            is_partition: true,
+                                        });
                                     }
-
-                                    // Abaikan partisi EFI sistem agar aman
-                                    if part_type.contains("EFI") || v_name == "EFI" {
-                                        continue;
-                                    }
-
-                                    let final_vname = if !v_name.is_empty() {
-                                        partition_labels.push(v_name.clone());
-                                        v_name
-                                    } else if !part_type.is_empty() {
-                                        part_type
-                                    } else {
-                                        "Tanpa Label".to_string()
-                                    };
-
-                                    let part_dev = format!("/dev/{}", part_id);
-                                    let display = format!("📁 [PARTISI AMAN] \"{}\" ({}) - {} (Partisi lain aman)", final_vname, part_size, part_dev);
-
-                                    partitions.push(DiskInfo {
-                                        device: part_dev,
-                                        parent_device: dev.clone(),
-                                        media_name: media_name.clone(),
-                                        volume_name: final_vname,
-                                        size: part_size,
-                                        protocol: protocol.clone(),
-                                        display,
-                                        is_usb: true,
-                                        is_partition: true,
-                                    });
                                 }
                             }
                         }
@@ -252,7 +255,7 @@ impl WinDiskApp {
                 }
             }
 
-            // Prioritaskan partisi yang ada kata "WIN" agar otomatis terpilih!
+            // Prioritaskan partisi yang mengandung kata "WIN" agar otomatis terpilih!
             partitions.sort_by(|a, b| {
                 let a_is_win = a.volume_name.to_lowercase().contains("win");
                 let b_is_win = b.volume_name.to_lowercase().contains("win");
@@ -274,7 +277,7 @@ impl WinDiskApp {
             };
 
             let whole_display = if partition_labels.len() > 1 {
-                format!("💾 [FULL DISK WIPE] {} ({}) - {} [⚠️ HAPUS SELURUH 1TB]", media_name, label_summary, dev)
+                format!("💾 [FULL DISK WIPE] {} ({}) - {} [⚠️ HAPUS SEMUA 1TB]", media_name, label_summary, dev)
             } else {
                 format!("💾 [SELURUH DRIVE] {} ({}) - {} [{}]", media_name, label_summary, whole_size, dev)
             };
@@ -468,7 +471,6 @@ impl WinDiskApp {
                 let _ = tx.send(BackgroundMessage::Status("Memasang patch driver Intel VMD / NVMe SSD (iaStorVD)...".to_string()));
                 let _ = tx.send(BackgroundMessage::LogLine("\n>> Memasang patch driver Intel RST VMD untuk deteksi NVMe...".to_string()));
 
-                // Folder $WinPEDriver$ dibaca otomatis oleh Windows PE saat instalasi dimulai
                 let target_dirs = [
                     "/Volumes/WIN11/$WinPEDriver$/Intel_VMD",
                     "/Volumes/WIN11/drivers/Intel_VMD",
@@ -736,6 +738,36 @@ impl eframe::App for WinDiskApp {
 
                             ui.add_space(8.0);
 
+                            // KARTU TOMBOL PILIH CEPAT PARTISI
+                            let partition_items: Vec<_> = self.available_disks.iter().filter(|d| d.is_partition).cloned().collect();
+                            if !partition_items.is_empty() {
+                                ui.label(egui::RichText::new("🎯 Klik Partisi yang Ingin Diformat (Partisi lain aman):").strong().size(12.0).color(egui::Color32::from_rgb(180, 200, 230)));
+                                ui.add_space(2.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    for part in &partition_items {
+                                        let is_selected = self.selected_disk == part.device;
+                                        let is_win_suggested = part.volume_name.to_lowercase().contains("win");
+                                        let tag = if is_win_suggested { " ⭐" } else { "" };
+                                        let btn_text = format!("📁 {}{}\n({})", part.volume_name, tag, part.size);
+
+                                        let btn = egui::Button::new(
+                                            egui::RichText::new(&btn_text)
+                                                .strong()
+                                                .size(12.0)
+                                                .color(if is_selected { egui::Color32::WHITE } else { egui::Color32::from_rgb(100, 240, 160) })
+                                        )
+                                        .fill(if is_selected { egui::Color32::from_rgb(37, 99, 235) } else { egui::Color32::from_rgb(26, 38, 32) })
+                                        .stroke(egui::Stroke::new(1.0, if is_selected { egui::Color32::from_rgb(90, 160, 255) } else { egui::Color32::from_rgb(46, 204, 113) }))
+                                        .min_size(egui::vec2(130.0, 36.0));
+
+                                        if ui.add(btn).clicked() {
+                                            self.selected_disk = part.device.clone();
+                                        }
+                                    }
+                                });
+                                ui.add_space(8.0);
+                            }
+
                             let selected_info = self.available_disks.iter().find(|d| d.device == self.selected_disk);
                             let selected_text = selected_info
                                 .map(|d| d.display.clone())
@@ -746,6 +778,9 @@ impl eframe::App for WinDiskApp {
                                         "Pilih Drive atau Partisi USB...".to_string()
                                     }
                                 });
+
+                            ui.label(egui::RichText::new("Atau pilih dari daftar dropdown:").size(11.0).color(egui::Color32::from_rgb(140, 150, 165)));
+                            ui.add_space(2.0);
 
                             egui::ComboBox::from_id_source("usb_combo_picker")
                                 .width(ui.available_width() - 8.0)
@@ -807,7 +842,7 @@ impl eframe::App for WinDiskApp {
                                             ui.add_space(2.0);
                                             ui.label(
                                                 egui::RichText::new(
-                                                    "Memilih opsi ini akan MENGHAPUS SEMUA PARTISI di drive ini (termasuk partisi Kontakt, dll.)! Jika hanya ingin memformat partisi Windows saja, pilih opsi [PARTISI AMAN] di dropdown atas."
+                                                    "Memilih opsi ini akan MENGHAPUS SEMUA PARTISI di drive ini (termasuk partisi Kontakt, dll.)! Jika hanya ingin memformat partisi Windows saja, pilih opsi [PARTISI AMAN] di tombol atas."
                                                 )
                                                 .color(egui::Color32::from_rgb(255, 200, 200))
                                                 .size(12.0)

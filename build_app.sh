@@ -8,7 +8,7 @@ APP_NAME="WinDisk Maker"
 APP_BUNDLE="${APP_NAME}.app"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET_DIR="${PROJECT_DIR}/target/release"
-BINARY_NAME="win-rufus-mac"
+BINARY_NAME="windisk-maker"
 
 echo "=========================================="
 echo "⚡ Membuat Bundle Aplikasi macOS: ${APP_NAME}"
@@ -27,7 +27,12 @@ mkdir -p "${PROJECT_DIR}/${APP_BUNDLE}/Contents/Resources"
 
 # 3. Salin executable biner
 echo "[3/4] Menyalin binary executable..."
-cp "${TARGET_DIR}/${BINARY_NAME}" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
+# Cari binary hasil build (bisa bernama windisk-maker atau win-rufus-mac sesuai Cargo.toml)
+if [ -f "${TARGET_DIR}/windisk-maker" ]; then
+    cp "${TARGET_DIR}/windisk-maker" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
+elif [ -f "${TARGET_DIR}/win-rufus-mac" ]; then
+    cp "${TARGET_DIR}/win-rufus-mac" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
+fi
 chmod +x "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
 
 # 4. Pasang icon dan Info.plist
@@ -67,9 +72,15 @@ cat << 'PLIST' > "${PROJECT_DIR}/${APP_BUNDLE}/Contents/Info.plist"
 </plist>
 PLIST
 
+# Salin otomatis ke /Applications jika ada
+if [ -d "/Applications" ]; then
+    echo "Memperbarui /Applications/${APP_BUNDLE}..."
+    rm -rf "/Applications/${APP_BUNDLE}"
+    cp -r "${PROJECT_DIR}/${APP_BUNDLE}" "/Applications/${APP_BUNDLE}"
+fi
+
 echo "=========================================="
-echo "✅ SUKSES! Aplikasi telah selesai dibuat:"
+echo "✅ SUKSES! Aplikasi telah selesai dibuat dan diperbarui di:"
 echo "👉 ${PROJECT_DIR}/${APP_BUNDLE}"
+echo "👉 /Applications/${APP_BUNDLE}"
 echo "=========================================="
-echo "💡 Anda bisa langsung mengklik ganda ${APP_BUNDLE}"
-echo "   atau memindahkannya ke folder /Applications!"
