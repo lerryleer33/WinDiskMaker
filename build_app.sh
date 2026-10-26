@@ -19,19 +19,45 @@ echo "[1/4] Mengompilasi kode dalam mode --release..."
 cd "${PROJECT_DIR}"
 cargo build --release
 
+# Tentukan target arsitektur lain agar bundle bisa universal (Intel + Apple Silicon).
+NATIVE_BINARY="${TARGET_DIR}/${BINARY_NAME}"
+OTHER_TARGET=""
+case "$(uname -m)" in
+    arm64) OTHER_TARGET="x86_64-apple-darwin" ;;
+    x86_64) OTHER_TARGET="aarch64-apple-darwin" ;;
+esac
+
 # 2. Buat struktur folder aplikasi .app
 echo "[2/4] Menyiapkan struktur folder .app..."
 rm -rf "${PROJECT_DIR}/${APP_BUNDLE}"
 mkdir -p "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS"
 mkdir -p "${PROJECT_DIR}/${APP_BUNDLE}/Contents/Resources"
 
-# 3. Salin executable biner
+# 3. Salin executable biner (universal jika target arsitektur lain tersedia)
 echo "[3/4] Menyalin binary executable..."
-# Cari binary hasil build (bisa bernama windisk-maker atau win-rufus-mac sesuai Cargo.toml)
-if [ -f "${TARGET_DIR}/windisk-maker" ]; then
-    cp "${TARGET_DIR}/windisk-maker" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
+if [ -f "${NATIVE_BINARY}" ]; then
+    if [ -n "${OTHER_TARGET}" ] && command -v rustup >/dev/null 2>&1 \
+        && rustup target list --installed 2>/dev/null | grep -qx "${OTHER_TARGET}" \
+        && command -v lipo >/dev/null 2>&1; then
+        echo "Membangun binary universal (${OTHER_TARGET})..."
+        cargo build --release --target "${OTHER_TARGET}"
+        OTHER_BINARY="${PROJECT_DIR}/target/${OTHER_TARGET}/release/${BINARY_NAME}"
+        if [ -f "${OTHER_BINARY}" ]; then
+            lipo -create "${NATIVE_BINARY}" "${OTHER_BINARY}" -output "${TARGET_DIR}/${BINARY_NAME}-universal"
+            cp "${TARGET_DIR}/${BINARY_NAME}-universal" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
+        else
+            echo "Peringatan: binary ${OTHER_TARGET} tidak ditemukan; memakai binary native."
+            cp "${NATIVE_BINARY}" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
+        fi
+    else
+        echo "Peringatan: target ${OTHER_TARGET:-lain} belum terpasang; app hanya untuk $(uname -m)."
+        cp "${NATIVE_BINARY}" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
+    fi
 elif [ -f "${TARGET_DIR}/win-rufus-mac" ]; then
     cp "${TARGET_DIR}/win-rufus-mac" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
+else
+    echo "Error: binary windisk-maker tidak ditemukan setelah proses build."
+    exit 1
 fi
 chmod +x "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/windisk-maker"
 
@@ -71,6 +97,13 @@ cat << 'PLIST' > "${PROJECT_DIR}/${APP_BUNDLE}/Contents/Info.plist"
 </dict>
 </plist>
 PLIST
+
+# Tanda tangani secara ad-hoc agar binary universal dapat dijalankan di Apple Silicon.
+if command -v codesign >/dev/null 2>&1; then
+    if ! codesign --force --deep --sign - "${PROJECT_DIR}/${APP_BUNDLE}" >/dev/null 2>&1; then
+        echo "Peringatan: gagal menandatangani bundle secara ad-hoc."
+    fi
+fi
 
 # Salin otomatis ke /Applications jika ada
 if [ -d "/Applications" ]; then
