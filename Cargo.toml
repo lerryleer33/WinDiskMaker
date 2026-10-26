@@ -1,7 +1,14 @@
 [package]
-name = "win-rufus-mac"
-version = "1.1.0"
+name = "windisk-maker"
+version = "1.2.0"
 edition = "2021"
+authors = ["lerryleer33"]
+description = "Modern & Fast Windows Bootable USB Creator for macOS with Intel RST VMD NVMe SSD Patch"
+license = "MIT"
+repository = "https://github.com/lerryleer33/WinDiskMaker"
+readme = "README.md"
+keywords = ["windows", "bootable", "usb", "macos", "vmd"]
+categories = ["command-line-utilities", "os::macos-apis"]
 
 [dependencies]
 eframe = "0.27"

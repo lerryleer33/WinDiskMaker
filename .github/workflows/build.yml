@@ -1,0 +1,49 @@
+name: Build & Release WinDisk Maker
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build & Test on macOS
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo Check
+        run: cargo check --verbose
+
+      - name: Cargo Build Release
+        run: cargo build --release --verbose
+
+      - name: Build macOS Application Bundle (.app)
+        run: |
+          chmod +x build_app.sh
+          ./build_app.sh
+          # Compress .app bundle into zip
+          zip -r "WinDisk-Maker-macOS.zip" "WinDisk Maker.app"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinDisk-Maker-macOS
+          path: WinDisk-Maker-macOS.zip
+
+      - name: Release Asset (On Tag Push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: WinDisk-Maker-macOS.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
