@@ -1,6 +1,6 @@
 [package]
 name = "windisk-maker"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 authors = ["lerryleer33"]
 description = "Modern & Fast Windows Bootable USB Creator for macOS with Intel RST VMD NVMe SSD Patch"
