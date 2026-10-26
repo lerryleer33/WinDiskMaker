@@ -420,12 +420,48 @@ impl WinDiskApp {
                 }
             }
 
-            // LANGKAH 2: Mount ISO Windows
-            let _ = tx.send(BackgroundMessage::Step(2));
-            let _ = tx.send(BackgroundMessage::Status("Memasang (mount) citra ISO Windows...".to_string()));
-            run_cmd_streaming(&tx, "hdiutil", &["mount", &iso]);
-            std::thread::sleep(Duration::from_secs(2));
+            // Dapatkan mount point target secara dinamis
+            let mut target_vol = String::new();
+            for _ in 0..6 {
+                std::thread::sleep(Duration::from_millis(500));
+                if let Ok(info_out) = Command::new("diskutil").args(&["info", &disk]).output() {
+                    let info_str = String::from_utf8_lossy(&info_out.stdout);
+                    for line in info_str.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("Mount Point:") {
+                            let mp = trimmed.trim_start_matches("Mount Point:").trim();
+                            if !mp.is_empty() && mp != "Not Mounted" {
+                                target_vol = mp.to_string();
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !target_vol.is_empty() {
+                    break;
+                }
+            }
 
+            if target_vol.is_empty() {
+                // Upayakan mount manual jika belum otomatis ter-mount
+                let _ = Command::new("diskutil").args(&["mount", &disk]).output();
+                std::thread::sleep(Duration::from_millis(500));
+                if FsPath::new("/Volumes/WIN11").exists() {
+                    target_vol = "/Volumes/WIN11".to_string();
+                }
+            }
+
+            if target_vol.is_empty() {
+                let _ = tx.send(BackgroundMessage::Finished(false, "Gagal mendapatkan lokasi kait (mount point) drive target setelah pemformatan.".to_string()));
+                return;
+            }
+            let _ = tx.send(BackgroundMessage::LogLine(format!("✓ Drive target terpasang pada: {}", target_vol)));
+
+            // LANGKAH 2: Deteksi / Mount ISO Windows
+            let _ = tx.send(BackgroundMessage::Step(2));
+            let _ = tx.send(BackgroundMessage::Status("Memeriksa dan memasang citra ISO Windows...".to_string()));
+            
+            // Cek apakah ISO sudah terpasang di /Volumes
             let mut iso_vol = String::new();
             if let Ok(out) = Command::new("ls").arg("/Volumes").output() {
                 let txt = String::from_utf8_lossy(&out.stdout);
@@ -439,30 +475,84 @@ impl WinDiskApp {
             }
 
             if iso_vol.is_empty() {
-                let _ = tx.send(BackgroundMessage::Finished(false, "Gagal menemukan volume berkas installer Windows dari ISO.".to_string()));
+                let _ = tx.send(BackgroundMessage::LogLine(format!(">> Memasang ISO: {}", iso)));
+                run_cmd_streaming(&tx, "hdiutil", &["mount", &iso]);
+                std::thread::sleep(Duration::from_secs(2));
+
+                if let Ok(out) = Command::new("ls").arg("/Volumes").output() {
+                    let txt = String::from_utf8_lossy(&out.stdout);
+                    for vol in txt.lines() {
+                        let check = format!("/Volumes/{}/setup.exe", vol);
+                        if FsPath::new(&check).exists() {
+                            iso_vol = format!("/Volumes/{}", vol);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if iso_vol.is_empty() {
+                let _ = tx.send(BackgroundMessage::Finished(false, "Gagal menemukan berkas installer Windows (setup.exe) di dalam ISO.".to_string()));
                 return;
             }
+            let _ = tx.send(BackgroundMessage::LogLine(format!("✓ Volume ISO Windows terdeteksi di: {}", iso_vol)));
 
-            // LANGKAH 3: Salin File Windows (kecuali install.wim)
+            // LANGKAH 3: Salin Berkas Windows (kecuali install.wim & install.esd)
             let _ = tx.send(BackgroundMessage::Step(3));
-            let _ = tx.send(BackgroundMessage::Status("Menyalin berkas Windows ke volume WIN11 (proses streaming)...".to_string()));
+            let _ = tx.send(BackgroundMessage::Status("Menyalin berkas Windows ke drive target (proses rsync)...".to_string()));
             let rsync_src = format!("{}/", iso_vol);
-            if !run_cmd_streaming(&tx, "rsync", &["-rltD", "--info=progress2", "--exclude=sources/install.wim", &rsync_src, "/Volumes/WIN11/"]) {
-                let _ = tx.send(BackgroundMessage::LogLine("Rsync peringatan minor, melanjutkan proses...".to_string()));
-            }
+            let rsync_dst = format!("{}/", target_vol);
+            
+            // Gunakan bendera rsync yang kompatibel penuh dengan macOS bawaan
+            let _rsync_ok = run_cmd_streaming(&tx, "rsync", &[
+                "-rtv",
+                "--progress",
+                "--exclude=sources/install.wim",
+                "--exclude=sources/install.esd",
+                &rsync_src,
+                &rsync_dst,
+            ]);
 
-            // LANGKAH 4: Pecah install.wim (UEFI FAT32 Split)
+            let check_target_setup = format!("{}/setup.exe", target_vol);
+            if !FsPath::new(&check_target_setup).exists() {
+                let _ = tx.send(BackgroundMessage::Finished(false, format!("Gagal menyalin berkas instalasi Windows ke {} (setup.exe tidak ditemukan).", target_vol)));
+                return;
+            }
+            let _ = tx.send(BackgroundMessage::LogLine("✓ Berkas sistem Windows (bootloader, setup, dsb.) berhasil disalin.".to_string()));
+
+            // Pastikan direktori sources ada di target sebelum memproses file image
+            let target_sources = format!("{}/sources", target_vol);
+            let _ = fs::create_dir_all(&target_sources);
+
+            // LANGKAH 4: Pecah install.wim (UEFI FAT32 Split) ATAU Salin install.esd
             let _ = tx.send(BackgroundMessage::Step(4));
             let wim_path = format!("{}/sources/install.wim", iso_vol);
+            let esd_path = format!("{}/sources/install.esd", iso_vol);
+
             if FsPath::new(&wim_path).exists() {
                 let _ = tx.send(BackgroundMessage::Status("Memecah install.wim menjadi format SWM (FAT32 UEFI Split)...".to_string()));
-                let _ = run_cmd_streaming(&tx, "wimlib-imagex", &["split", &wim_path, "/Volumes/WIN11/sources/install.swm", "3800"]);
-            } else {
-                let esd_path = format!("{}/sources/install.esd", iso_vol);
-                if FsPath::new(&esd_path).exists() {
-                    let _ = tx.send(BackgroundMessage::Status("Menyalin install.esd langsung ke USB...".to_string()));
-                    let _ = run_cmd_streaming(&tx, "cp", &[&esd_path, "/Volumes/WIN11/sources/install.esd"]);
+                let _ = tx.send(BackgroundMessage::LogLine(format!(">> Menjalankan wimlib-imagex split dari {} ke {}/install.swm...", wim_path, target_sources)));
+                
+                let target_swm = format!("{}/install.swm", target_sources);
+                let split_ok = run_cmd_streaming(&tx, "wimlib-imagex", &["split", &wim_path, &target_swm, "3800"]);
+                
+                if !split_ok || !FsPath::new(&target_swm).exists() {
+                    let _ = tx.send(BackgroundMessage::Finished(false, "Gagal memecah berkas install.wim! Periksa ruang sisa drive.".to_string()));
+                    return;
                 }
+                let _ = tx.send(BackgroundMessage::LogLine("✓ Berkas install.wim berhasil dipecah menjadi SWM untuk dukungan UEFI FAT32.".to_string()));
+            } else if FsPath::new(&esd_path).exists() {
+                let _ = tx.send(BackgroundMessage::Status("Menyalin berkas terkompresi install.esd ke USB...".to_string()));
+                let target_esd = format!("{}/install.esd", target_sources);
+                let _ = run_cmd_streaming(&tx, "rsync", &["-rtv", "--progress", &esd_path, &target_esd]);
+                if !FsPath::new(&target_esd).exists() {
+                    let _ = tx.send(BackgroundMessage::Finished(false, "Gagal menyalin berkas install.esd!".to_string()));
+                    return;
+                }
+                let _ = tx.send(BackgroundMessage::LogLine("✓ Berkas install.esd berhasil disalin.".to_string()));
+            } else {
+                let _ = tx.send(BackgroundMessage::Finished(false, "Tidak ditemukan install.wim maupun install.esd di dalam berkas ISO!".to_string()));
+                return;
             }
 
             // LANGKAH 5: Injeksi Driver Intel VMD / NVMe Patch (iaStorVD)
@@ -472,8 +562,8 @@ impl WinDiskApp {
                 let _ = tx.send(BackgroundMessage::LogLine("\n>> Memasang patch driver Intel RST VMD untuk deteksi NVMe...".to_string()));
 
                 let target_dirs = [
-                    "/Volumes/WIN11/$WinPEDriver$/Intel_VMD",
-                    "/Volumes/WIN11/drivers/Intel_VMD",
+                    format!("{}/$WinPEDriver$/Intel_VMD", target_vol),
+                    format!("{}/drivers/Intel_VMD", target_vol),
                 ];
 
                 let driver_files: [(&str, &[u8]); 5] = [
@@ -509,9 +599,13 @@ impl WinDiskApp {
                 }
             }
 
-            // LANGKAH 6: Finalisasi & Unmount ISO
+            // LANGKAH 6: Finalisasi, Sinkronisasi Cache & Unmount ISO
             let _ = tx.send(BackgroundMessage::Step(6));
-            let _ = tx.send(BackgroundMessage::Status("Menyelesaikan dan melepaskan berkas ISO...".to_string()));
+            let _ = tx.send(BackgroundMessage::Status("Menyelesaikan sinkronisasi data ke drive USB...".to_string()));
+            let _ = tx.send(BackgroundMessage::LogLine(">> Menyinkronkan buffer penyimpanan (sync)...".to_string()));
+            let _ = Command::new("sync").output();
+
+            let _ = tx.send(BackgroundMessage::Status("Melepaskan berkas ISO...".to_string()));
             run_cmd_streaming(&tx, "hdiutil", &["unmount", &iso_vol]);
 
             let _ = tx.send(BackgroundMessage::Finished(
