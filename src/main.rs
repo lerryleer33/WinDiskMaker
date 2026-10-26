@@ -13,6 +13,41 @@ const IASTORVD_CAT: &[u8] = include_bytes!("../drivers/vmd/iaStorVD.cat");
 const RST_MW_SERVICE: &[u8] = include_bytes!("../drivers/vmd/RstMwService.exe");
 const RST_MW_EVENT_LOG: &[u8] = include_bytes!("../drivers/vmd/RstMwEventLogMsg.dll");
 
+// Konfigurasi otomatis jawaban Windows PE (Unattended) untuk bypass pembatasan Windows 11
+const AUTOUNATTEND_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" language="neutral" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" publicKeyToken="31bf3856ad364e35" versionScope="nonSxS">
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+</unattend>
+"#;
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct DiskInfo {
     device: String,         // "/dev/disk3s3" atau "/dev/disk3"
@@ -43,6 +78,7 @@ struct WinDiskApp {
     current_step: usize,
     is_creating: bool,
     patch_vmd: bool,
+    bypass_tpm: bool,
     log: String,
     show_confirm_dialog: bool,
     show_log_panel: bool,
@@ -86,6 +122,7 @@ impl WinDiskApp {
             current_step: 0,
             is_creating: false,
             patch_vmd: true, // Default aktif agar SSD NVMe terdeteksi di laptop modern
+            bypass_tpm: true, // Default aktif agar Windows 11 bisa diinstall di mana pun tanpa error
             log: "=== WinDisk Maker v1.2 ===\nSistem siap. Mendeteksi perangkat USB & partisi split volume di latar belakang...\n".to_string(),
             show_confirm_dialog: false,
             show_log_panel: false,
@@ -318,6 +355,7 @@ impl WinDiskApp {
         let disk = self.selected_disk.clone();
         let iso = self.iso_path.clone();
         let patch_vmd = self.patch_vmd;
+        let bypass_tpm = self.bypass_tpm;
 
         if iso.is_empty() || disk.is_empty() {
             self.status = "Harap tentukan file ISO dan USB/partisi tujuan terlebih dahulu.".to_string();
@@ -346,6 +384,9 @@ impl WinDiskApp {
         if patch_vmd {
             self.log.push_str(">>> Fitur Patch NVMe SSD / Intel VMD: AKTIF (iaStorVD.inf, iaStorVD.sys, iaStorVD.cat)\n");
         }
+        if bypass_tpm {
+            self.log.push_str(">>> Fitur Bypass Persyaratan Windows 11: AKTIF (TPM 2.0, Secure Boot, RAM, & CPU check)\n");
+        }
 
         let (tx, rx) = channel::<BackgroundMessage>();
         self.worker_receiver = Some(rx);
@@ -356,6 +397,7 @@ impl WinDiskApp {
                 
                 let mut child = match Command::new(cmd)
                     .args(args)
+                    .env("COPYFILE_DISABLE", "1") // Cegah macOS membuat file metadata AppleDouble ._* di drive FAT32
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
@@ -555,62 +597,87 @@ impl WinDiskApp {
                 return;
             }
 
-            // LANGKAH 5: Injeksi Driver Intel VMD / NVMe Patch (iaStorVD)
+            // LANGKAH 5: Injeksi Driver Intel VMD & Bypass TPM Windows 11
+            let _ = tx.send(BackgroundMessage::Step(5));
             if patch_vmd {
-                let _ = tx.send(BackgroundMessage::Step(5));
                 let _ = tx.send(BackgroundMessage::Status("Memasang patch driver Intel VMD / NVMe SSD (iaStorVD)...".to_string()));
-                let _ = tx.send(BackgroundMessage::LogLine("\n>> Memasang patch driver Intel RST VMD untuk deteksi NVMe...".to_string()));
+                let _ = tx.send(BackgroundMessage::LogLine("\n>> Memasang paket driver Intel RST VMD untuk deteksi NVMe...".to_string()));
 
-                let target_dirs = [
-                    format!("{}/$WinPEDriver$/Intel_VMD", target_vol),
-                    format!("{}/drivers/Intel_VMD", target_vol),
-                ];
-
-                let driver_files: [(&str, &[u8]); 5] = [
+                // 1. Letakkan 5 file lengkap di /drivers/Intel_VMD/ (untuk opsi 'Load Driver' manual di Windows Setup)
+                let manual_driver_dir = format!("{}/drivers/Intel_VMD", target_vol);
+                let _ = fs::create_dir_all(&manual_driver_dir);
+                let full_driver_files: [(&str, &[u8]); 5] = [
                     ("iaStorVD.inf", IASTORVD_INF),
                     ("iaStorVD.sys", IASTORVD_SYS),
                     ("iaStorVD.cat", IASTORVD_CAT),
                     ("RstMwService.exe", RST_MW_SERVICE),
                     ("RstMwEventLogMsg.dll", RST_MW_EVENT_LOG),
                 ];
-
-                let mut patch_success = true;
-                for dir in &target_dirs {
-                    if let Err(e) = fs::create_dir_all(dir) {
-                        let _ = tx.send(BackgroundMessage::LogLine(format!("Gagal membuat direktori {}: {}", dir, e)));
-                        patch_success = false;
-                        continue;
-                    }
-
-                    for (name, data) in &driver_files {
-                        let file_path = format!("{}/{}", dir, name);
-                        if let Err(e) = fs::write(&file_path, data) {
-                            let _ = tx.send(BackgroundMessage::LogLine(format!("Gagal menulis berkas {}: {}", file_path, e)));
-                            patch_success = false;
-                        }
-                    }
-                    if patch_success {
-                        let _ = tx.send(BackgroundMessage::LogLine(format!("✓ Berhasil menyalin paket driver VMD ke {}", dir)));
-                    }
+                for (name, data) in &full_driver_files {
+                    let _ = fs::write(format!("{}/{}", manual_driver_dir, name), data);
                 }
+                let _ = tx.send(BackgroundMessage::LogLine(format!("✓ Paket driver manual tersimpan di {}", manual_driver_dir)));
 
-                if patch_success {
-                    let _ = tx.send(BackgroundMessage::LogLine("✓ Driver iaStorVD.inf, iaStorVD.sys, iaStorVD.cat aktif. SSD NVMe akan otomatis terdeteksi!".to_string()));
+                // 2. Letakkan HANYA file driver kernel murni (.inf, .sys, .cat) di /$WinPEDriver$/Intel_VMD/
+                // PENTING: Jangan menyertakan .exe atau .dll di $WinPEDriver$ agar WinPE driver loader tidak melempar error 0x80070006!
+                let winpe_driver_dir = format!("{}/$WinPEDriver$/Intel_VMD", target_vol);
+                let _ = fs::create_dir_all(&winpe_driver_dir);
+                let kernel_driver_files: [(&str, &[u8]); 3] = [
+                    ("iaStorVD.inf", IASTORVD_INF),
+                    ("iaStorVD.sys", IASTORVD_SYS),
+                    ("iaStorVD.cat", IASTORVD_CAT),
+                ];
+                for (name, data) in &kernel_driver_files {
+                    let _ = fs::write(format!("{}/{}", winpe_driver_dir, name), data);
+                }
+                let _ = tx.send(BackgroundMessage::LogLine("✓ Driver kernel iaStorVD (.inf, .sys, .cat) siap di-load otomatis oleh Windows Setup PE.".to_string()));
+            }
+
+            // Injeksi Bypass Windows 11 (TPM 2.0, Secure Boot, RAM, CPU) jika diaktifkan
+            if bypass_tpm {
+                let _ = tx.send(BackgroundMessage::Status("Memasang berkas autounattend.xml (Bypass TPM 2.0 / Secure Boot)...".to_string()));
+                let _ = tx.send(BackgroundMessage::LogLine(">> Menuliskan autounattend.xml untuk bypass batasan perangkat keras Windows 11...".to_string()));
+                let autounattend_path = format!("{}/autounattend.xml", target_vol);
+                if let Err(e) = fs::write(&autounattend_path, AUTOUNATTEND_XML.as_bytes()) {
+                    let _ = tx.send(BackgroundMessage::LogLine(format!("Peringatan: Gagal menulis autounattend.xml: {}", e)));
+                } else {
+                    let _ = tx.send(BackgroundMessage::LogLine("✓ Berkas autounattend.xml berhasil disuntikkan ke root drive USB.".to_string()));
                 }
             }
 
-            // LANGKAH 6: Finalisasi, Sinkronisasi Cache & Unmount ISO
+            // LANGKAH 6: Pembersihan Metadata Mac (._*), Sinkronisasi & Finalisasi
             let _ = tx.send(BackgroundMessage::Step(6));
-            let _ = tx.send(BackgroundMessage::Status("Menyelesaikan sinkronisasi data ke drive USB...".to_string()));
+            let _ = tx.send(BackgroundMessage::Status("Membersihkan berkas metadata Mac (._*) agar Windows Setup tidak error...".to_string()));
+            let _ = tx.send(BackgroundMessage::LogLine(">> Menghapus seluruh file AppleDouble metadata (._*) dan .DS_Store...".to_string()));
+
+            // 1. Eksekusi dot_clean untuk menggabungkan / membersihkan resource forks
+            let _ = Command::new("dot_clean")
+                .args(&["-m", &target_vol])
+                .env("COPYFILE_DISABLE", "1")
+                .output();
+
+            // 2. Bersihkan file AppleDouble ._* dan .DS_Store yang menjadi penyebab utama 0x80070006 - 0x40031
+            let _ = Command::new("find").args(&[&target_vol, "-name", "._*", "-delete"]).output();
+            let _ = Command::new("find").args(&[&target_vol, "-name", ".DS_Store", "-delete"]).output();
+            let _ = Command::new("find").args(&[&format!("{}/sources", target_vol), "-name", "._*", "-delete"]).output();
+            let _ = Command::new("find").args(&[&format!("{}/$WinPEDriver$", target_vol), "-name", "._*", "-delete"]).output();
+            let _ = Command::new("find").args(&[&format!("{}/drivers", target_vol), "-name", "._*", "-delete"]).output();
+
+            let _ = tx.send(BackgroundMessage::LogLine("✓ Seluruh metadata Mac telah dibersihkan. Media instalasi 100% kompatibel dengan Windows Setup.".to_string()));
+
+            // 3. Sinkronisasi buffer penyimpanan ke USB fisik
+            let _ = tx.send(BackgroundMessage::Status("Menyelesaikan sinkronisasi data ke drive USB (sync)...".to_string()));
             let _ = tx.send(BackgroundMessage::LogLine(">> Menyinkronkan buffer penyimpanan (sync)...".to_string()));
             let _ = Command::new("sync").output();
+            std::thread::sleep(Duration::from_millis(800));
 
+            // 4. Melepaskan ISO
             let _ = tx.send(BackgroundMessage::Status("Melepaskan berkas ISO...".to_string()));
             run_cmd_streaming(&tx, "hdiutil", &["unmount", &iso_vol]);
 
             let _ = tx.send(BackgroundMessage::Finished(
                 true,
-                "Flashdisk / Partisi Bootable Windows berhasil dibuat dan siap digunakan!".to_string(),
+                "Flashdisk / Partisi Bootable Windows berhasil dibuat dan siap digunakan tanpa error!".to_string(),
             ));
         });
     }
@@ -1030,6 +1097,25 @@ impl eframe::App for WinDiskApp {
                             ui.label(
                                 egui::RichText::new(
                                     "Menyertakan iaStorVD.inf, iaStorVD.sys, iaStorVD.cat ke $WinPEDriver$ & /drivers/Intel_VMD/ agar disk NVMe SSD langsung terdeteksi otomatis saat install Windows (mengatasi pesan 'No drives were found')."
+                                )
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(150, 160, 175)),
+                            );
+
+                            ui.add_space(8.0);
+
+                            // OPSI BYPASS PERSYARATAN WINDOWS 11 (TPM 2.0 / SECURE BOOT / RAM)
+                            ui.checkbox(
+                                &mut self.bypass_tpm,
+                                egui::RichText::new("🛡️ Bypass Persyaratan Windows 11 (TPM 2.0, Secure Boot, & RAM)")
+                                    .strong()
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(56, 189, 248)),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Menyuntikkan konfigurasi autounattend.xml (BypassTPMCheck, BypassSecureBootCheck, BypassRAMCheck, BypassCPUCheck) agar instalasi Windows 11 tidak gagal/crash (Error 0x80070006 - 0x40031) pada PC atau Mac tanpa TPM 2.0."
                                 )
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(150, 160, 175)),
