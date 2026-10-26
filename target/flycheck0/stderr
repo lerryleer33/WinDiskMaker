@@ -1,0 +1,28 @@
+   0.584946764s  INFO prepare_target{force=false package_id=win-rufus-mac v1.1.0 (/Users/mac/Downloads/win-rufus-mac) target="win-rufus-mac"}: cargo::core::compiler::fingerprint: fingerprint error for win-rufus-mac v1.1.0 (/Users/mac/Downloads/win-rufus-mac)/Check { test: true }/TargetInner { name: "win-rufus-mac", doc: true, ..: with_path("/Users/mac/Downloads/win-rufus-mac/src/main.rs", Edition2021) }
+   0.586649791s  INFO prepare_target{force=false package_id=win-rufus-mac v1.1.0 (/Users/mac/Downloads/win-rufus-mac) target="win-rufus-mac"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/mac/Downloads/win-rufus-mac/target/debug/.fingerprint/win-rufus-mac-dfa6234a9552eb9f/test-bin-win-rufus-mac`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+  18: <unknown>
+    Checking win-rufus-mac v1.1.0 (/Users/mac/Downloads/win-rufus-mac)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.55s
